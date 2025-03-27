@@ -49,7 +49,6 @@ library(ggplot2)
 ggplot() + geom_sf(data = locs_obs) + geom_sf(data = predict_lines)
 
 # now, let's simulate
-fit <- locs_fit
 sim_tracks <- sim_fit(x = locs_fit, what = "predicted", reps = 2)
 
 # Error in `sim_fit()`:
