@@ -1,0 +1,270 @@
+---
+title: "`aniMotum` tracks crossing the dateline"
+execute:
+  warning: false
+  error: false
+format: gfm
+---
+
+# Summary of the Issue
+
+Telemetry deployments that cross the dateline (180 longitude) are not
+supported by the simulation function `aniMotum::sim_fit()` because the 
+function presumes coordinates are in Mercator coordinate space. Further, it
+seems that only observation data originaly provided as geographic (lon/lat)
+is supported by `aniMotum::sim_fit()` and any data provided as a projected
+`sf` object (regardless if it spans 180) is not compatible.
+
+# Expected Outcome
+
+Since projected data are supported within the `aniMotum::fit_ssm()` and the
+`aniMotum::grab()` functions, I expected those `ssm_df` fit objects to
+also be supported within `aniMotum::sim_fit()`. For deployments that do not
+cross 180, supplying lon/lat data is a workaround. But, this is not an option for
+those that do cross 180.
+
+# Further details
+
+I took some time to look through the code for `aniMotum::sim_fit()` and it
+looks like there's a presumption of Mercator projection throughout. The CRS of the
+input data for `aniMotum::fit_ssm()` would need to be stored in the resulting
+`ssm_df` for downstream use. Or, possibly leverage setting `as_sf = TURE` within
+the `grab()` function at https://github.com/ianjonsen/aniMotum/blob/7300841984562af373becaaac68789c81e056777/R/sim_fit.R#L143-L149.
+It also seems the extent would need to be properly set given the provided
+projection and range of data. Lastly, the code for specifying a `start` and `end`
+coordinate value would need to support projected coordinates or, maybe, an
+`sf_point()`.
+
+# Example code demonstrating the issue
+
+## User-specified projections with `aniMotum::fit_ssm()`
+
+The `aniMotum` package sets a default 'mercator'
+projection which serves as a sensible spatial projection for many animal
+telemetry datasets. In some cases, though, a researcher may want to provide
+data in a specific, regional projection. The function `aniMotum::fit_ssm()`
+can accept an `sf` object with a specified projection and the model is fit and 
+predictions are made within this projection.
+
+As an example, here are results from fitting two seal deployments. The
+spotted seal (shown in red) has movement that crosses 180 longitude. The
+harbor seal (shown in blue), by comparison, does not cross 180. 
+
+The data and code are available at https://github.com/jmlondon/animotum-reprex
+
+Note the
+observation data are transformed into EPSG:3571 which is a Bering Sea centric
+Lambert-Azimuthal Equal Area projection.
+
+
+```{r}
+#| message: false
+library(dplyr)
+library(sf)
+library(geoarrow)
+library(arrow)
+library(aniMotum)
+
+seal_locs <- open_dataset("seal_locs_obs.parquet") |>
+  sf::st_as_sf() |>
+  sf::st_transform(3571) |>
+  dplyr::filter(between(locs_dt, deploy_dt, end_dt)) |>
+  dplyr::rename(datetime = locs_dt) |>
+  dplyr::mutate(
+    quality = case_when(
+      type == "FastGPS" ~ "G",
+      type == "User" ~ "G",
+      .default = quality
+    )
+  ) |>
+  dplyr::filter(!quality %in% c("Z")) |>
+  dplyr::select(
+    speno,
+    deployid,
+    species,
+    tag_family,
+    datetime,
+    quality,
+    error_semi_major_axis,
+    error_semi_minor_axis,
+    error_ellipse_orientation,
+    error_radius,
+    geometry = geom
+  )
+
+locs_fit <- aniMotum::fit_ssm(
+  x = seal_locs,
+  vmax = 8,
+  model = "crw",
+  time.step = 0.25,
+  id = "speno",
+  date = "datetime",
+  lc = "quality",
+  epar = c(
+    "error_semi_major_axis",
+    "error_semi_minor_axis",
+    "error_ellipse_orientation"
+  ),
+  map = list(psi = factor(NA)),
+  tz = "UTC"
+)
+
+predict_pts <-
+  aniMotum::grab(locs_fit, what = "predicted", as_sf = TRUE, group = TRUE) |>
+  dplyr::rename(speno = id, datetime = date)
+
+predict_lines <- predict_pts %>%
+  dplyr::group_by(speno) %>%
+  dplyr::summarise(do_union = FALSE) %>%
+  sf::st_cast("LINESTRING")
+
+library(ggplot2)
+
+ggplot() +
+  geom_sf(data = seal_locs, color = c("black")) +
+  geom_sf(data = predict_lines, color = c("#D81B60", "#1E88E5"))
+
+```
+
+## Simulating tracks leads to unexpected results
+
+Now that we have model fits and predicted tracks, a next step in the workflow
+might be to create simulated tracks using the `aniMotum::sim_fit()` function.
+
+Since the model fits and predictions were in our custom projection, the
+initial presumption is that the simulated tracks would also be generated
+in the same projection .. 
+
+```{r}
+# now, let's simulate
+sim_tracks <- sim_fit(x = locs_fit, what = "predicted", reps = 2)
+
+sim_tracks |> plot()
+```
+
+Well, that doesn't look correct. In fact, if we take a look at the coordinate
+data for each seal, we can see things have gotten bungled
+
+```{r}
+sim_tracks |>
+  tidyr::unnest(sims) |>
+  dplyr::filter(id == "PL2018_1002", rep == 0) |>
+  head()
+```
+
+```{r}
+sim_tracks |>
+  tidyr::unnest(sims) |>
+  dplyr::filter(id == "PV2015_1008", rep == 0) |>
+  head()
+```
+
+The values for the 'lon' and 'lat' columns are not correct for the Bering Sea.
+But, maybe, the 'x' and 'y' coordinate values are correct?
+
+```{r}
+sim_tracks |>
+  tidyr::unnest(sims) |>
+  dplyr::filter(id == "PL2018_1002", rep == 0) |>
+  sf::st_as_sf(coords = c("x", "y"), crs = 3571) |>
+  sf::st_geometry() |>
+  ggplot() +
+  geom_sf()
+```
+
+Ok, maybe we're on to something. Let's do the same for the other reps
+(`rep == 0` returns the predicted track only).
+
+```{r}
+sim_tracks |>
+  tidyr::unnest(sims) |>
+  dplyr::filter(id == "PL2018_1002", rep %in% 1:2) |>
+  sf::st_as_sf(coords = c("x", "y"), crs = 3571) |>
+  sf::st_geometry() |>
+  ggplot() +
+  geom_sf()
+```
+
+Well, that didn't work. The `x` and `y` coordinate values seem to be in different
+coordinate reference systems. And, looking at the `aniMotum::sim_fit()` function
+code it seems there is a presumption data are in the Mercator projection.
+
+For the harbor seal, we could transform the data back to geographic (lon/lat) 
+before fit and prediction. For, spotted seal, transforming to geographic will 
+cause world wrap issues
+
+## Test with geographic (lon/lat) data
+
+Let's take a step back in the process and re-fit the harbor seal data with
+a geographic (lon/lat) coordinate reference system (EPSG:4326). Behind the
+scenes, `aniMotum` will transform the coordinates into the default Mercator
+projection before fitting.
+
+```{r}
+pv_locs_merc <- seal_locs |>
+  dplyr::filter(species == "Harbor seal") |>
+  sf::st_transform(4326)
+
+pv_locs_fit <- aniMotum::fit_ssm(
+  x = pv_locs_merc,
+  vmax = 8,
+  model = "crw",
+  time.step = 0.25,
+  id = "speno",
+  date = "datetime",
+  lc = "quality",
+  epar = c(
+    "error_semi_major_axis",
+    "error_semi_minor_axis",
+    "error_ellipse_orientation"
+  ),
+  map = list(psi = factor(NA)),
+  tz = "UTC"
+)
+```
+
+Now, let's try simulating tracks and see what we get
+
+```{r}
+# now, let's simulate
+sim_tracks <- sim_fit(x = pv_locs_fit, what = "predicted", reps = 2)
+
+sim_tracks |> plot()
+```
+
+Ok, so that seems to work for the harbor seal. Now, let's try with the
+Spotted seal observations that span 180.
+
+```{r}
+pl_locs_merc <- seal_locs |>
+  dplyr::filter(species == "Spotted seal") |>
+  sf::st_transform(4326)
+
+pl_locs_fit <- aniMotum::fit_ssm(
+  x = pl_locs_merc,
+  vmax = 8,
+  model = "crw",
+  time.step = 0.25,
+  id = "speno",
+  date = "datetime",
+  lc = "quality",
+  epar = c(
+    "error_semi_major_axis",
+    "error_semi_minor_axis",
+    "error_ellipse_orientation"
+  ),
+  map = list(psi = factor(NA)),
+  tz = "UTC"
+)
+```
+
+Will the simulation return sensible results?
+
+```{r}
+# now, let's simulate
+sim_tracks <- sim_fit(x = pl_locs_fit, what = "predicted", reps = 2)
+
+sim_tracks |> plot()
+```
+
+Alas, no.
